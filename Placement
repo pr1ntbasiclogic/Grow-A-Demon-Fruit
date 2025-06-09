@@ -1,0 +1,145 @@
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local HttpService         = game:GetService("HttpService")
+
+local DataManager         = require(ServerScriptService.DATA.DataManager)
+local PlantGrowth         = require(ServerScriptService.SEED.PlantGrowth)
+local SeedConfig          = require(ReplicatedStorage.CONFIG.SeedConfig)
+local PlantActionFunction = ReplicatedStorage.SEED_RE.PlantActionFunction
+local plotAssigner = ReplicatedStorage:WaitForChild("PLOT"):WaitForChild("plotAssigner")
+
+local function getCurrentPlot(player)
+	for _, plot in ipairs(workspace.WorldFolder.PlayerPlots:GetChildren()) do
+		local owner = plot:FindFirstChild("Owner")
+		if owner and owner.Value == player.Name then
+			return plot
+		end
+	end
+end
+
+local function getTopCropModel(part, plot)
+	local current = part
+	while current and current ~= plot do
+		if current:IsA("Model") and current.Parent == plot then
+			return current
+		end
+		current = current.Parent
+	end
+	return nil
+end
+
+PlantActionFunction.OnServerInvoke = function(player, seed, lookObject, position, action, teleportCFrameOverride)
+	local plot = getCurrentPlot(player)
+	if not plot then return false, "No plot found" end
+
+	if not lookObject or not lookObject:IsDescendantOf(plot) then
+		return false, "Invalid or missing target object"
+	end
+
+	local tp = plot:FindFirstChild("Teleport")
+	if teleportCFrameOverride and typeof(teleportCFrameOverride) == "CFrame" then
+		tp = { CFrame = teleportCFrameOverride } 
+	end
+	if not tp then return false, "No teleport found" end
+
+	if action == "plant" then
+		if not lookObject.Name:find("Dirt") then
+			return false, "Not valid soil"
+		end
+
+		if not (seed:IsDescendantOf(player.Character) or seed:IsDescendantOf(player.Backpack)) then
+			return false, "Seed not in inventory"
+		end
+
+		local rawName = seed.Name:gsub(" Seed", "")
+		local sd = SeedConfig.Seeds[rawName]
+		if not sd then return false, "SeedConfig missing for " .. rawName end
+		
+		
+		local sizeRoll, accSize = math.random(), 0
+		local pickedSize = "Normal"
+		for name, chance in pairs(SeedConfig.SizeChances) do
+			accSize += chance
+			if sizeRoll <= accSize then
+				pickedSize = name
+				break
+			end
+		end
+
+		local minKG = sd.MinKG or 0.5
+		local maxKG = sd.MaxKG or 2.0
+		local bias = math.pow(math.random(), 2)
+		local pickedKG = tonumber(string.format("%.2f", bias * (maxKG - minKG) + minKG))
+		local scale = SeedConfig.getScaleFromSizeAndKG(pickedSize, pickedKG)
+		local cycleTime = sd.GrowthTimeCycle
+		
+		local level = math.clamp(DataManager.GetStat(player, "GrowthSpeed") or 0, 0, 10)
+		local speedMult = 1 - (0.05 * level)
+		cycleTime = math.max(1, cycleTime * speedMult)
+
+		local offset = tp.CFrame:PointToObjectSpace(position)
+		local cropRecord = {
+			UID                = HttpService:GenerateGUID(false),
+			Name               = rawName,
+			currentGrowthCycle = 0,
+			GrowthTimeCycle    = cycleTime,
+			LocalPosition      = { x = offset.X, y = offset.Y, z = offset.Z },
+			PlantedAt          = os.time(),
+			InstantGrow        = false,
+			LocalRotation = { rX = lookObject.Orientation.X, rY = lookObject.Orientation.Y, rZ = lookObject.Orientation.Z },
+			PickedSize = pickedSize,
+			KG = pickedKG,
+			Scale = scale,
+		}
+
+		local ok, err = DataManager.PlantCrop(player, cropRecord)
+		if not ok then
+			warn("PlantCrop failed:", err)
+			return false, err
+		end
+		seed:Destroy()
+		PlantGrowth.StartCropGrowth(player, cropRecord)
+
+		local data = DataManager.Get(player)
+		for i, invItem in ipairs(data.Inventory) do
+			if invItem.Name == rawName and invItem.Type == "Seed" then
+				DataManager.RemoveItem(player, i)
+				break
+			end
+		end
+
+		if not player.Stats.Tutorial.Completed.Value and player.Stats.Tutorial.Step.Value == 1 then
+			DataManager.ManageStat(player, "Tutorial.Step", "add", 1)
+		end
+
+		return true
+
+	elseif action == "remove" then
+		local model = getTopCropModel(lookObject, plot)
+		if not model then
+			return false, "No model found under plot"
+		end
+
+		local primary = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart")
+		if not primary then
+			return false, "No primary part in model"
+		end
+
+		local data = DataManager.Get(player)
+		for i, crop in ipairs(data.Crops) do
+			local localOffset = Vector3.new(crop.LocalPosition.x, crop.LocalPosition.y, crop.LocalPosition.z)
+			local worldPos = tp.CFrame:ToWorldSpace(CFrame.new(localOffset)).Position
+			local distance = (primary.Position - worldPos).Magnitude
+
+			if (primary.Position - worldPos).Magnitude < 2 then
+				crop._removed = true
+				DataManager.HarvestCrop(player, i)
+				PlantGrowth.RemoveCropInstanceByUID(crop.UID)
+				model:Destroy()
+				return true
+			end
+		end
+		return false, "No crop record matched position"
+	end
+	return false, "Invalid action"
+end
