@@ -1,0 +1,212 @@
+local ReplicatedStorage   = game:GetService("ReplicatedStorage")
+local Workspace           = game:GetService("Workspace")
+local DataManager         = require(game:GetService("ServerScriptService"):WaitForChild("DATA"):WaitForChild("DataManager"))
+local SeedConfig          = require(ReplicatedStorage:WaitForChild("CONFIG"):WaitForChild("SeedConfig"))
+local MarketplaceService  = game:GetService("MarketplaceService")
+local Notif_RE            = ReplicatedStorage:WaitForChild("NOTIF"):WaitForChild("Notif_RE")
+
+local HarvestHandler = {}
+
+local function getCurrentPlot(player)
+	for _, plot in ipairs(Workspace.WorldFolder.PlayerPlots:GetChildren()) do
+		local o = plot:FindFirstChild("Owner")
+		if o and o.Value == player.Name then
+			return plot, plot:FindFirstChild("Teleport")
+		end
+	end
+end
+
+local function getModelScaleFactor(model)
+	local totalOriginalSize = Vector3.zero
+	local totalCurrentSize = Vector3.zero
+
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") then
+			local originalSize = part:GetAttribute("OriginalSize")
+			if originalSize then
+				totalOriginalSize += Vector3.new(unpack(string.split(originalSize, ",")))
+				totalCurrentSize += part.Size
+			end
+		end
+	end
+
+	if totalOriginalSize.Magnitude == 0 then
+		return 1 
+	end
+
+	return totalCurrentSize.Magnitude / totalOriginalSize.Magnitude
+end
+
+local function matchToolSizeFromFruitModel(clone, fruitModel)
+	for _, part in ipairs(clone:GetDescendants()) do
+		if part:IsA("BasePart") then
+			local sourcePart = fruitModel:FindFirstChild(part.Name)
+			if sourcePart and sourcePart:IsA("BasePart") then
+				part.Size = sourcePart.Size
+				local mesh = part:FindFirstChildWhichIsA("SpecialMesh")
+				local sourceMesh = sourcePart:FindFirstChildWhichIsA("SpecialMesh")
+				if mesh and sourceMesh then
+					mesh.Scale = sourceMesh.Scale
+				elseif mesh then
+					mesh.Scale = Vector3.new(1, 1, 1)
+				end
+			end
+			part.Anchored = false
+			part.CanCollide = false
+			part.Massless = true
+		end
+	end
+
+	if clone:IsA("Tool") then
+		clone.RequiresHandle = false
+		if not clone:FindFirstChild("Handle") then
+			local candidate = clone:FindFirstChildWhichIsA("BasePart")
+			if candidate then
+				candidate.Name = "Handle"
+			end
+		end
+	end
+end
+
+function HarvestHandler.attemptHarvest(harvester, fruitModel, cropOwner)
+	local plot, tp = getCurrentPlot(cropOwner)
+	if not (plot and tp) then return end
+
+	local cropUID = fruitModel:GetAttribute("CropUID")
+	if typeof(cropUID) ~= "string" then return end
+
+	local data = DataManager.Get(cropOwner)
+	if not data or not data.Crops then return end
+
+	local rec
+	for _, crop in ipairs(data.Crops) do
+		if crop.UID == cropUID then
+			rec = crop
+			break
+		end
+	end
+	if not rec then
+		warn("No matching crop found for UID: ", cropUID)
+		return
+	end
+	rec.PickedParts     = rec.PickedParts or {}
+	rec.FruitParts      = rec.FruitParts or {}
+	rec.PartsRemaining  = rec.PartsRemaining or 0
+
+	local fruitUID = fruitModel:GetAttribute("FruitUID")
+	if not fruitUID then
+		warn("Missing FruitUID on fruit model: ", fruitModel.Name)
+		return
+	end
+
+	if not fruitModel:IsDescendantOf(Workspace) then
+		warn("[ABORT] Fruit is no longer in workspace:", fruitModel:GetFullName())
+		return
+	end
+	if fruitModel:GetAttribute("Harvested") then
+		warn("Already harvested: ", fruitModel:GetFullName())
+		return
+	end
+	if rec.PickedParts[fruitUID] then
+		warn("Already picked: ", fruitUID)
+		return
+	end
+
+	local fruitInfo = rec.FruitParts[fruitUID]
+	if not fruitInfo then
+		warn("No fruit info stored for: ", fruitUID)
+		return
+	end
+
+	fruitModel:SetAttribute("Harvested", true)
+	rec.PickedParts[fruitUID] = true
+	rec.PartsRemaining = math.max(0, rec.PartsRemaining - 1)
+
+	if rec.PartsRemaining <= 0 then
+		rec.FruitParts = {}
+		rec.PickedParts = {}
+		DataManager.UpdateCrop(cropOwner, rec)
+	end
+
+	local pickedMod  = fruitInfo.Modifier or "None"
+	local pickedSize = fruitInfo.Size or "Normal"
+	local kg         = fruitInfo.KG or 1.0
+	local stageIdx   = math.clamp(rec.currentGrowthCycle + 1, 1, SeedConfig.MaxGrowthStage)
+	local baseName   = rec.Name:gsub("%s+Seed", ""):gsub("%s+Fruit%d+", ""):gsub("%s+", "")
+
+	local baseTool = game.ServerStorage.FRUITS:FindFirstChild(("%s Fruit"):format(baseName))
+	if baseTool then
+		local clone = baseTool:Clone()
+		local visualScale = fruitInfo.Scale or getModelScaleFactor(fruitModel)
+		pcall(function() clone:ScaleTo(visualScale) end)
+		
+		local modPrefix = (pickedMod ~= "None" and pickedMod .. " ") or ""
+		clone.Name = string.format("%s%s Fruit [KG: %.2f]", modPrefix, baseName, kg)
+
+		local modData = SeedConfig.Modifiers[pickedMod]
+		if pickedMod == "Rainbow" then
+			local union = clone:FindFirstChildWhichIsA("UnionOperation")
+			if union then
+				union.UsePartColor = true
+			end
+			task.spawn(function()
+				local RunService = game:GetService("RunService")
+				local startTime = tick()
+				while clone and clone:IsDescendantOf(game) do
+					local hue = ((tick() - startTime) % 5) / 5
+					local color = Color3.fromHSV(hue, 1, 1)
+					for _, part in ipairs(clone:GetDescendants()) do
+						if part:IsA("BasePart") then
+							part.Color = color
+							part.Material = Enum.Material.Neon
+						end
+					end
+					RunService.Heartbeat:Wait()
+				end
+			end)
+		elseif modData then
+			for _, part in ipairs(clone:GetDescendants()) do
+				if part:IsA("BasePart") then
+					if modData.Color then part.Color = modData.Color end
+					if modData.Material then part.Material = modData.Material end
+				end
+			end
+		end
+		local scale = fruitInfo.Scale or 1.0
+
+		local visualScale = getModelScaleFactor(fruitModel)		
+		local success = DataManager.AddItem(harvester, {
+			Name     = clone.Name,
+			Type     = "Fruit",
+			Modifier = pickedMod,
+			Size     = pickedSize,
+			KG       = kg,
+			Base     = baseName,
+			Stage    = stageIdx,
+			Scale    = scale,  -- 🔥 Store the actual scale
+		})
+
+		if success then
+			local union = clone:FindFirstChildWhichIsA("UnionOperation")
+			if pickedMod ~= "None" and union then
+				union.UsePartColor = true
+			end
+			clone.Parent = harvester.Backpack
+			harvester.Character.Harvest.PlaybackSpeed = math.round((1 + math.random() * 0.5) * 100) / 100
+			harvester.Character.Harvest:Play()
+			fruitModel:Destroy()
+			if harvester.UserId ~= cropOwner.UserId then
+				Notif_RE:FireAllClients(harvester.Name.." stole from ".. cropOwner.Name)
+			end
+			DataManager.UpdateQuestProgress(harvester, "harvest_crops", 1)
+			if not harvester.Stats.Tutorial.Completed.Value and harvester.Stats.Tutorial.Step.Value == 2 then
+				DataManager.ManageStat(harvester, "Tutorial.Step", "add", 1)
+			end
+		else
+			clone:Destroy()
+			Notif_RE:FireClient(harvester, "Inventory full. Could not collect fruit.", true)
+		end
+	end
+end
+
+return HarvestHandler
