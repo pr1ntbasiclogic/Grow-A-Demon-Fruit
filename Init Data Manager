@@ -1,0 +1,188 @@
+local AnalyticsService = game:GetService("AnalyticsService")
+local Players = game:GetService("Players")
+local Workspace = game:GetService("Workspace")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ClientReady = ReplicatedStorage:WaitForChild("Comm"):WaitForChild("ClientReady")
+local DataManager = require(script.Parent.DataManager)
+local plotAssigner = ReplicatedStorage:WaitForChild("PLOT"):WaitForChild("plotAssigner")
+local PlantGrowth = require(game:GetService("ServerScriptService").SEED.PlantGrowth)
+
+local PlayerPlots = Workspace:WaitForChild("WorldFolder"):WaitForChild("PlayerPlots")
+local plots = {
+	PlayerPlots.Plot1,
+	PlayerPlots.Plot2,
+	PlayerPlots.Plot3,
+	PlayerPlots.Plot4,
+	PlayerPlots.Plot5,
+	PlayerPlots.Plot6,
+}
+
+local assignedPlots = {} 
+local occupiedPlots = {} 
+local assignmentQueue = {}
+local pendingCropLoads = {}
+local assigningPlot = false
+
+local function assignPlotSafe(player)
+	table.insert(assignmentQueue, player)
+	local TIMEOUT = 10
+	local startTime = os.clock()
+
+	while assigningPlot or assignmentQueue[1] ~= player do
+		if os.clock() - startTime > TIMEOUT then
+			warn(`Timed out assigning plot to {player.Name}`)
+			table.remove(assignmentQueue, table.find(assignmentQueue, player))
+			return
+		end
+		task.wait()
+	end
+
+	assigningPlot = true
+
+	for _, plot in ipairs(plots) do
+		if not occupiedPlots[plot] then
+			assignedPlots[player.UserId] = plot
+			occupiedPlots[plot] = true
+
+			local screen = plot:WaitForChild("Sign"):WaitForChild("TextPart"):WaitForChild("Screen")
+			local label = screen:FindFirstChildWhichIsA("TextLabel") or screen:FindFirstChildWhichIsA("TextBox")
+			if label then
+				label.Text = player.Name .. "'s Garden"
+			end
+
+			plot.Owner.Value = player.Name
+
+			local char = player.Character or player.CharacterAdded:Wait()
+			char:WaitForChild("HumanoidRootPart").CFrame = plot.Teleport.CFrame
+
+			plotAssigner:FireClient(player, plot)
+			break
+		end
+	end
+
+	if not assignedPlots[player.UserId] then
+		warn(`No available plots for {player.Name} — server may be full`)
+	end
+
+	assigningPlot = false
+	table.remove(assignmentQueue, 1)
+end
+
+local function removePlot(player)
+	local plot
+	for _, p in ipairs(plots) do
+		if p.Owner.Value == player.Name then
+			plot = p
+			break
+		end
+	end
+	if plot then
+		for _, child in ipairs(plot:GetChildren()) do
+			if child:IsA("Model") and not table.find({ "Teleport", "Sign", "Dirt1", "Dirt2"}, child.Name) then
+				child:Destroy()
+			end
+		end
+		plot.Owner.Value = ""
+
+		local screen = plot:FindFirstChild("Sign")
+			and plot.Sign:FindFirstChild("TextPart")
+			and plot.Sign.TextPart:FindFirstChild("Screen")
+
+		if screen then
+			local label = screen:FindFirstChildWhichIsA("TextLabel") or screen:FindFirstChildWhichIsA("TextBox")
+			if label then
+				label.Text = "Empty Garden"
+			end
+		end
+		occupiedPlots[plot] = nil
+		assignedPlots[player.UserId] = nil
+	end
+end
+
+ReplicatedStorage:WaitForChild("SkipLoading_RE").OnServerEvent:Connect(function(player)
+	player:SetAttribute("SkippedLoad", true)
+	player:SetAttribute("IsReady", true)
+end)
+
+Players.PlayerAdded:Connect(function(player)
+	AnalyticsService:LogOnboardingFunnelStepEvent(player, 1, "Joined game")
+	DataManager.Load(player)
+	local data = DataManager.Get(player)
+
+	local function restoreInventory()
+		local backpack = player:FindFirstChild("Backpack") or player:WaitForChild("Backpack", 5)
+		if backpack then
+			DataManager.RestoreInventory(player)
+		else
+		end
+	end
+
+	player:GetAttributeChangedSignal("IsReady"):Connect(function()
+		if player:GetAttribute("IsReady") then
+			if player.Character then
+				restoreInventory()
+			end
+
+			player.CharacterAdded:Connect(function()
+				restoreInventory()
+				if assignedPlots[player.UserId] then
+					player.Character:WaitForChild("HumanoidRootPart").CFrame = assignedPlots[player.UserId].Teleport.CFrame
+				end
+			end)
+		end
+	end)
+
+	local clientReadyConn
+	clientReadyConn = ClientReady.OnServerEvent:Connect(function(signalPlayer)
+		if signalPlayer ~= player then return end
+		if clientReadyConn then
+			clientReadyConn:Disconnect()
+			clientReadyConn = nil
+		end
+
+		assignPlotSafe(player)
+
+		local plot = assignedPlots[player.UserId]
+		if not plot then return end
+
+		local tp = plot:FindFirstChild("Teleport")
+		if not tp then return end
+		if not data or not data.Crops then return end
+
+		local function resumeAllCrops(player, crops)
+			local uid = player.UserId
+			pendingCropLoads[uid] = #crops
+
+			for _, crop in ipairs(crops) do
+				task.defer(function()
+					PlantGrowth.ResumeCropGrowth(player, crop)
+					pendingCropLoads[uid] -= 1
+
+					if pendingCropLoads[uid] == 0 and not player:GetAttribute("SkippedLoad") then
+						task.wait(2)
+						player:SetAttribute("IsReady", true)
+					end
+				end)
+			end
+		end
+		resumeAllCrops(player, data.Crops)
+	end)
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+	DataManager.UpdatePlayerTimePlayed(player)
+	DataManager.Save(player)
+	DataManager.Remove(player)
+	removePlot(player)
+	player:SetAttribute("GrowPromptName", nil)
+end)
+
+game:BindToClose(function()
+	for _, player in ipairs(Players:GetPlayers()) do
+		local success = DataManager.Save(player)
+		if not success then
+			warn("Failed to save data for:", player.Name)
+		end
+	end
+	task.wait(3)
+end)
