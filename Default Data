@@ -1,0 +1,41 @@
+local DefaultData = {}
+
+function DefaultData.Get()
+	local now = os.time()
+	return {
+		Relly          = 75,
+		Kills          = 0,
+		Inventory      = {}, 		 -- Inv cap: 50, 
+		Crops          = {},     -- Crop cap: 120.
+		MoneyMulti     = 0,
+		GrowthSpeed    = 0,
+		DamageMulti    = 0,
+		Luck           = 0,
+		DailyRewardStreak = 0,
+		AllowGifting = true,
+		AssignedPlot   = nil,
+		LastOnline     = now, -- for offline growth
+		LastForeverPackTime = 0,
+		ForeverPackIndex = 0,
+		DailyReward = {
+			LastClaimed = 0,         -- os.time of last reward (obv)
+			Streak = 0,
+			Day = 1,                 -- 1 to 7
+		},
+		Quests = {
+			LastReset = 0,
+			Active = {},
+			BonusClaimed = false,
+		},
+		OneTimeRewards = {
+			StarterPack = false,
+			JoinedGroup = false,
+		},
+		Tutorial = {
+			Completed = true,
+			Step = 0,
+		}
+	}
+end
+
+return DefaultData
