@@ -1,0 +1,420 @@
+local Workspace          = game:GetService("Workspace")
+local ReplicatedStorage  = game:GetService("ReplicatedStorage")
+local TweenService       = game:GetService("TweenService")
+local HttpService        = game:GetService("HttpService")
+local SeedConfig         = require(ReplicatedStorage.CONFIG.SeedConfig)
+local HarvestHandler     = require(game:GetService("ServerScriptService").SEED.HarvestHandler)
+local DataManager        = require(game:GetService("ServerScriptService").DATA.DataManager)
+
+local seedPlacementCircle = ReplicatedStorage.seedPlacementCircle
+local PlantModelFolder    = ReplicatedStorage.PlantModelFolder
+
+local PlantGrowth = {}
+local activeStages = {}
+local runningCrops = {}
+
+-- makes a crop have a 'tween' like effect by fading out then destroying it.
+local function fadeAndDestroy(model)
+	if not model or not model:IsA("Model") then return end
+
+	for uid, trackedModel in pairs(activeStages) do
+		if trackedModel == model then
+			activeStages[uid] = nil
+			break
+		end
+	end
+
+	for _, part in ipairs(model:GetDescendants()) do
+		if not part:IsA("BasePart") then continue end
+			TweenService:Create(part, TweenInfo.new(0.5), { Transparency = 1 }):Play()
+	end
+
+	task.delay(0.6, function()
+		if model and model:IsDescendantOf(workspace) then
+			model:Destroy()
+		end
+	end)
+end
+
+-- calculates the correct distance from the ground, so the plant is surface level
+local function getModelBottomOffset(model)
+	local minY = math.huge
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") then
+			local bottomY = part.Position.Y - (part.Size.Y / 2)
+			minY = math.min(minY, bottomY)
+		end
+	end
+	local primaryY = model.PrimaryPart.Position.Y - (model.PrimaryPart.Size.Y / 2)
+	return primaryY - minY
+end
+
+local function growStage(model, position, scaleMultiplier, stageName, tweenDuration)
+	local offsetY = getModelBottomOffset(model)
+	model:SetPrimaryPartCFrame(CFrame.new(position + Vector3.new(0, offsetY, 0)))
+	model.Parent = workspace
+
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") then
+			part.Transparency = 1
+			part.CanCollide = false
+		end
+	end
+
+	pcall(function()
+		model:ScaleTo(scaleMultiplier)
+	end)
+
+	task.delay(0.1, function()
+		for _, part in ipairs(model:GetDescendants()) do
+			if not part:IsA("BasePart") and part.Name ~= ("RootPart") then continue end
+				TweenService:Create(part, TweenInfo.new(tweenDuration), {
+					Transparency = 0,
+				}):Play()
+				part.CanCollide = true
+		end
+	end)
+	
+	-- specific key for this plant, based on exact position. 
+	local posKey = ("%0.2f_%0.2f_%0.2f"):format(position.X, position.Y, position.Z)
+	if activeStages[posKey] then
+		fadeAndDestroy(activeStages[posKey])
+	end
+	activeStages[posKey] = model
+end
+
+local function getCurrentPlot(player)
+	for _, plot in ipairs(Workspace.WorldFolder.PlayerPlots:GetChildren()) do
+		local o = plot:FindFirstChild("Owner")
+		if o and o.Value == player.Name then
+			return plot, plot:FindFirstChild("Teleport")
+		end
+	end
+end
+
+local function originalSpawn(player, record, worldPos)
+	local rawName   = record.Name
+	local stageIdx  = math.clamp(record.currentGrowthCycle + 1, 1, SeedConfig.MaxGrowthStage)
+	local modelName = rawName:gsub("Seed", "Plant") .. "Growth" .. stageIdx
+
+	local template = PlantModelFolder:WaitForChild(modelName)
+	if not template then
+		warn("Missing plant model:", modelName)
+		return nil
+	end
+
+	local model = template:Clone()
+	model.Parent = workspace
+	
+	local function getModelBottomOffset(model)
+		local minY = math.huge
+		for _, part in ipairs(model:GetDescendants()) do
+			if part:IsA("BasePart") then
+				local bottomY = part.Position.Y - (part.Size.Y / 2)
+				if bottomY < minY then
+					minY = bottomY
+				end
+			end
+		end
+
+		local primaryY = model.PrimaryPart.Position.Y - (model.PrimaryPart.Size.Y / 2)
+		return primaryY - minY
+	end
+
+	local offsetY = getModelBottomOffset(model)
+	model:SetPrimaryPartCFrame(CFrame.new(worldPos + Vector3.new(0, offsetY, 0)))
+
+	if record.Scale then
+		pcall(function()
+			model:ScaleTo(record.Scale)
+		end)
+	end
+	for _, part in ipairs(model:GetDescendants()) do
+		if not part:IsA("BasePart") and part.Name ~= "RootPart" then continue end
+		part:SetAttribute("OriginalSize", ("%f,%f,%f"):format(part.Size.X, part.Size.Y, part.Size.Z))
+		part.Transparency = 0
+		part.CanCollide   = true
+	end
+	return model, stageIdx
+end
+
+-- this function sets up the proximity prompt logic (ownership/steal/and creates a record for every fruitpart), and also returns the model and stage index
+local function attachFruitPrompts(player, record, model, stageIdx)
+	if stageIdx < SeedConfig.MaxGrowthStage then return end 
+
+	record.PickedParts    = record.PickedParts or {}
+	record.PartsRemaining = 0
+	record.FruitParts     = record.FruitParts or {}
+
+	for _, fruitModel in ipairs(model:GetChildren()) do
+		if fruitModel:IsA("Model") and fruitModel.Name:match("^FruitPart%d+") then
+			local fruitName = fruitModel.Name
+
+			local fruitUID = nil
+			for uid, info in pairs(record.FruitParts) do
+				if info.FruitName == fruitModel.Name then
+					fruitUID = uid
+					break
+				end
+			end
+			if not fruitUID then
+				fruitUID = HttpService:GenerateGUID(false)
+			end
+
+			if record.PickedParts[fruitUID] then
+				fruitModel:Destroy()
+			else
+				local part = fruitModel.PrimaryPart or fruitModel:FindFirstChildWhichIsA("BasePart")
+				if not part then continue end
+
+				fruitModel:SetAttribute("FruitUID", fruitUID)
+				fruitModel:SetAttribute("CropUID", record.UID)
+				fruitModel:SetAttribute("PlayerUserId", player.UserId)
+				fruitModel.PrimaryPart = part
+				
+				for _, part in ipairs(fruitModel:GetDescendants()) do
+					if not part:IsA("BasePart") then continue end
+						part:SetAttribute("OriginalSize", ("%f,%f,%f"):format(part.Size.X, part.Size.Y, part.Size.Z))
+				end
+				
+				if not record.FruitParts[fruitUID] then
+					local pickedMod = "None"
+					local pickedSize = record.PickedSize or "Normal"
+					local kg = record.KG or 1.0
+					local scale = record.Scale or SeedConfig.getScaleFromSizeAndKG(pickedSize, kg)
+
+					record.FruitParts[fruitUID] = {
+						Modifier = pickedMod,
+						Size     = pickedSize,
+						KG       = kg,
+						FruitName  = fruitModel.Name,
+						Scale = scale,
+					}
+					DataManager.UpdateCrop(player, record)
+				end
+
+				local fruitInfo = record.FruitParts[fruitUID]
+				local pickedMod = fruitInfo.Modifier or "None"
+				local pickedSize = fruitInfo.Size or "Normal"
+				local kg = fruitInfo.KG or 1.0
+
+				local modData = SeedConfig.Modifiers[pickedMod]
+				
+				-- specific visual effects based on assigned modifier. (Rainbow, etc)
+				if pickedMod == "Rainbow" then
+					if fruitModel:FindFirstChildWhichIsA("Union") then
+						fruitModel:FindFirstChildWhichIsA("Union").UsePartColor = true
+					end
+					task.spawn(function()
+						local RunService = game:GetService("RunService")
+						local startTime = tick()
+						while fruitModel and fruitModel:IsDescendantOf(game) do
+							local hue = ((tick() - startTime) % 5) / 5
+							local color = Color3.fromHSV(hue, 1, 1)
+							for _, part in ipairs(fruitModel:GetDescendants()) do
+								if not part:IsA("BasePart") then continue end
+									part.Color = color
+									part.Material = Enum.Material.Neon
+							end
+							RunService.Heartbeat:Wait()
+						end
+					end)
+				elseif modData then
+					for _, p in ipairs(fruitModel:GetDescendants()) do
+						if p:IsA("BasePart") then
+							if modData.Color then p.Color = modData.Color end
+							if modData.Material then p.Material = modData.Material end
+						end
+					end
+				end
+
+				local sizeData = SeedConfig.Size[pickedSize]
+				if sizeData then
+					local scale = sizeData.Scale or 1
+					fruitModel:SetAttribute("Scale", scale)
+				end
+
+				local highlight = Instance.new("Highlight")
+				highlight.Name = "CollectHighlight"
+				highlight.FillTransparency = 1
+				highlight.OutlineTransparency = 0
+				highlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+				highlight.Enabled = false
+				highlight.Parent = fruitModel
+
+				local prompt = Instance.new("ProximityPrompt")
+				prompt.ActionText = "Collect"
+				prompt.HoldDuration = 0.1
+				prompt.RequiresLineOfSight = false
+				prompt.Enabled = false
+				prompt.Parent = part
+				task.defer(function() prompt.Enabled = true end)
+
+				local debounce = false
+				prompt.Triggered:Connect(function(plr)
+					if debounce then return end
+					debounce = true
+					local ownerId = fruitModel:GetAttribute("PlayerUserId")
+					if ownerId == plr.UserId then
+						HarvestHandler.attemptHarvest(plr, fruitModel, player)
+					else
+						local fruitUID = fruitModel:GetAttribute("FruitUID")
+						if fruitUID then
+							print("THIEF PROMPT")
+							plr:SetAttribute("StealingFruit", fruitUID)
+							plr:SetAttribute("StealingFruitTime", os.time())
+							game:GetService("MarketplaceService"):PromptProductPurchase(plr, 3300710976)
+						end
+					end
+					task.delay(0.5, function()
+						debounce = false
+					end)
+				end)
+				record.PartsRemaining += 1
+			end
+		end
+	end
+end
+
+function PlantGrowth.SpawnCropFromRecord(player, record, worldPos)
+	local model, stageIdx = originalSpawn(player, record, worldPos)
+	if not model then return end
+	
+	if record._removed then
+		model:Destroy()
+		return nil
+	end
+	if stageIdx >= SeedConfig.MaxGrowthStage then
+		attachFruitPrompts(player, record, model, stageIdx)
+	end
+
+	return model
+end
+
+function PlantGrowth.StartCropGrowth(player, record, regrowOnly, forceRestart)
+	local plot, tp = getCurrentPlot(player)
+	if not (plot and tp) then return end
+
+	if runningCrops[record.UID] and not forceRestart then
+		return
+	end
+	runningCrops[record.UID] = true
+
+	if typeof(record.LocalPosition) ~= "table" or
+		type(record.LocalPosition.x) ~= "number" or
+		type(record.LocalPosition.y) ~= "number" or
+		type(record.LocalPosition.z) ~= "number" then
+		warn("Invalid LocalPosition for crop: ", record.UID, player.Name)
+		return 
+	end
+
+	local lp = record.LocalPosition
+	local safeOffset = Vector3.new(
+		math.clamp(lp.x, -100, 100),
+		math.clamp(lp.y, -10, 10),
+		math.clamp(lp.z, -100, 100)
+	)
+	local worldPos = tp.CFrame:PointToWorldSpace(Vector3.new(lp.x, lp.y, lp.z))
+	if not regrowOnly then
+		local spc = seedPlacementCircle:Clone()
+		spc.Position = worldPos
+		spc.Anchored = true
+		spc.Transparency = 0
+		spc.CanCollide = false
+		spc.Parent = workspace
+
+		TweenService:Create(spc, TweenInfo.new(0.5), { Size = spc.Size * 5 }):Play()
+		task.wait(0.5)
+		TweenService:Create(spc, TweenInfo.new(0.5), { Size = spc.Size * 0.1 }):Play()
+		task.wait(0.5)
+		spc:Destroy()
+	end
+
+	local model
+	if not regrowOnly then
+		model = PlantGrowth.SpawnCropFromRecord(player, record, worldPos)
+		if not model then 
+			runningCrops[record.UID] = nil
+			return 
+		end
+		model.Parent = plot
+	else
+		for _, m in ipairs(plot:GetDescendants()) do
+			if m:IsA("Model") and m.PrimaryPart and (m.PrimaryPart.Position - worldPos).Magnitude < 1 then
+				model = m
+				break
+			end
+		end
+	end
+
+	if record.InstantGrow then
+		record.InstantGrow = nil
+		record.currentGrowthCycle = SeedConfig.MaxGrowthStage
+		if model then fadeAndDestroy(model) end
+		local fullModel = PlantGrowth.SpawnCropFromRecord(player, record, worldPos)
+		if fullModel then
+			fullModel.Parent = plot
+		end
+		runningCrops[record.UID] = nil 
+		return
+	end
+	
+	-- Main growth loop of the plant.
+	task.spawn(function()
+		while true do
+			if record._removed then
+				if model then fadeAndDestroy(model) end
+				break 
+			end
+
+			if record.currentGrowthCycle < SeedConfig.MaxGrowthStage then
+				task.wait(record.GrowthTimeCycle)
+				if record._removed then break end
+
+				if model then fadeAndDestroy(model) end
+
+				record.currentGrowthCycle += 1
+				record.currentGrowthCycle = math.min(record.currentGrowthCycle, SeedConfig.MaxGrowthStage)
+
+				model = PlantGrowth.SpawnCropFromRecord(player, record, worldPos)
+				if model then model.Parent = plot end
+			else
+				-- waits for ALL the the 'FruitParts' to be collect before regrowing. (infinite loop of growing fruits)
+				repeat
+					task.wait(1)
+					if record._removed then
+						if model then fadeAndDestroy(model) end
+						break
+					end
+				until (record.PartsRemaining or 0) <= 0
+
+				task.wait(record.GrowthTimeCycle)
+				if record._removed then break end
+
+				if model and model:IsDescendantOf(plot) then
+					fadeAndDestroy(model)
+				end
+
+				model = PlantGrowth.SpawnCropFromRecord(player, record, worldPos)
+				if model then model.Parent = plot end
+			end
+		end
+		runningCrops[record.UID] = nil
+	end)
+end
+
+function PlantGrowth.RemoveCropInstanceByUID(uid)
+	for key, model in pairs(activeStages) do
+		if key == uid or model:GetAttribute("CropUID") == uid then
+			activeStages[key] = nil
+			if model and model:IsDescendantOf(workspace) then
+				fadeAndDestroy(model)
+			end
+			break
+		end
+	end
+end
+
+PlantGrowth.ResumeCropGrowth = PlantGrowth.StartCropGrowth
+
+	return PlantGrowth
