@@ -1,3 +1,4 @@
+--updatev1
 local SeedConfig = {}
 
 SeedConfig.MaxGrowthStage = 5
