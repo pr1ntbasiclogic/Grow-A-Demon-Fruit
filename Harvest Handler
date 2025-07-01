@@ -183,7 +183,7 @@ function HarvestHandler.attemptHarvest(harvester, fruitModel, cropOwner)
 			KG       = kg,
 			Base     = baseName,
 			Stage    = stageIdx,
-			Scale    = scale,  -- 🔥 Store the actual scale
+			Scale    = scale,  --  stores the actual scale
 		})
 
 		if success then
