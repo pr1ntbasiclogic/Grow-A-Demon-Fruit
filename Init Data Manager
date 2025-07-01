@@ -1,3 +1,4 @@
+--updatev1
 local AnalyticsService = game:GetService("AnalyticsService")
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
